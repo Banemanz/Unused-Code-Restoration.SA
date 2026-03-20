@@ -19,6 +19,7 @@
 #include "CPed.h"
 #include "CPlayerPed.h"
 #include "CWorld.h"
+#include "CPools.h"
 #include "CTimer.h"
 #include "CMessages.h"
 #include "ePedBones.h"
@@ -85,6 +86,9 @@ namespace {
         bool         updateMatricesRequired{};
         unsigned int pedIKFlags{};
         CVector      lastMoveSpeed{};
+        bool         wasStanding{};
+        bool         wasInAir{};
+        float        airTime{};
     };
 
     static const std::array<BoneDef, 13> kBoneDefs{ {
@@ -190,6 +194,15 @@ namespace {
         return reinterpret_cast<AnimBlendFrameDataEx*>(frame);
     }
 
+    struct ActiveRagdoll {
+        bool                                         enabled{};
+        bool                                         manual{};
+        CPed* ped{};
+        unsigned                                     startedAt{};
+        PedRuntimeState                              saved{};
+        std::array<BoneRuntime, kBoneDefs.size()>    bones{};
+    };
+
     class RestoredRagdollSingleCpp {
     public:
         RestoredRagdollSingleCpp() {
@@ -204,128 +217,221 @@ namespace {
     private:
         static RestoredRagdollSingleCpp* ms_instance;
 
-        bool                      m_enabled{};
-        unsigned                  m_nextToggleTime{};
-        CPlayerPed* m_ped{};
-        PedRuntimeState           m_savedPedState{};
-        std::array<BoneRuntime, kBoneDefs.size()> m_bones{};
+        static constexpr size_t   MAX_RAGDOLLS = 8;
+        static constexpr float    AUTO_RADIUS = 35.0f;
+        static constexpr float    KEEP_RADIUS = 55.0f;
+        static constexpr unsigned MIN_ACTIVE_MS = 1200;
+
+        unsigned m_nextToggleTime{};
+        std::array<ActiveRagdoll, MAX_RAGDOLLS> m_ragdolls{};
 
     private:
-        static bool IsPedUsable(CPlayerPed* ped) {
-            return ped && ped->IsAlive() && ped->m_pRwObject && !ped->bInVehicle && !ped->m_pVehicle;
+        static bool CanRagdollPed(CPed* ped) {
+            return ped && ped->m_pRwObject && !ped->bInVehicle && !ped->m_pVehicle && !ped->bDontRender;
+        }
+
+        static bool ShouldAutoActivate(CPed* ped) {
+            return ped && (!ped->IsAlive() || ped->bIsInTheAir || ped->bKnockedUpIntoAir || ped->bIsLanding || ped->bFallenDown || ped->bIsDyingStuck);
+        }
+
+        static float DistanceToPlayer(const CPed* ped, const CPed* player) {
+            if (!ped || !player) {
+                return 99999.0f;
+            }
+            return DistanceBetweenPoints(ped->GetPosition(), player->GetPosition());
+        }
+
+        ActiveRagdoll* FindRagdoll(CPed* ped) {
+            for (auto& ragdoll : m_ragdolls) {
+                if (ragdoll.enabled && ragdoll.ped == ped) {
+                    return &ragdoll;
+                }
+            }
+            return nullptr;
+        }
+
+        ActiveRagdoll* AllocateRagdoll() {
+            for (auto& ragdoll : m_ragdolls) {
+                if (!ragdoll.enabled) {
+                    return &ragdoll;
+                }
+            }
+            return nullptr;
         }
 
         void Process() {
             auto* player = FindPlayerPed();
 
-            if (CTimer::m_snTimeInMilliseconds >= m_nextToggleTime && KeyPressed(VK_F7)) {
+            if (CTimer::m_snTimeInMilliseconds >= m_nextToggleTime && KeyPressed(VK_F7) && player) {
                 m_nextToggleTime = CTimer::m_snTimeInMilliseconds + TOGGLE_COOLDOWN_MS;
-                if (m_enabled) {
-                    Disable();
+                if (auto* existing = FindRagdoll(player)) {
+                    Disable(*existing, true);
                 }
-                else if (IsPedUsable(player)) {
-                    Enable(player);
+                else {
+                    if (auto* slot = AllocateRagdoll()) {
+                        Enable(*slot, player, true);
+                    }
                 }
             }
 
-            if (!m_enabled) {
+            AutoActivateNearbyPeds(player);
+
+            for (auto& ragdoll : m_ragdolls) {
+                if (!ragdoll.enabled) {
+                    continue;
+                }
+                UpdateOne(ragdoll, player);
+            }
+        }
+
+        void AutoActivateNearbyPeds(CPed* player) {
+            if (!CPools::ms_pPedPool || !player) {
                 return;
             }
 
-            if (!IsPedUsable(player) || player != m_ped) {
-                Disable();
+            for (int i = 0; i < CPools::ms_pPedPool->m_nSize; ++i) {
+                auto* ped = CPools::ms_pPedPool->GetAt(i);
+                if (!ped || FindRagdoll(ped) || !CanRagdollPed(ped)) {
+                    continue;
+                }
+
+                if (DistanceToPlayer(ped, player) > AUTO_RADIUS) {
+                    continue;
+                }
+
+                if (!ShouldAutoActivate(ped)) {
+                    continue;
+                }
+
+                if (auto* slot = AllocateRagdoll()) {
+                    Enable(*slot, ped, ped == player);
+                }
+                else {
+                    return;
+                }
+            }
+        }
+
+        void UpdateOne(ActiveRagdoll& ragdoll, CPed* player) {
+            if (!CanRagdollPed(ragdoll.ped)) {
+                Disable(ragdoll, ragdoll.manual);
+                return;
+            }
+
+            if (!ragdoll.manual && player && DistanceToPlayer(ragdoll.ped, player) > KEEP_RADIUS) {
+                Disable(ragdoll, false);
+                return;
+            }
+
+            const bool recovered = ragdoll.ped->IsAlive() && ragdoll.ped->bIsStanding && !ragdoll.ped->bIsInTheAir && !ragdoll.ped->bKnockedUpIntoAir;
+            if (!ragdoll.manual && recovered && CTimer::m_snTimeInMilliseconds - ragdoll.startedAt >= MIN_ACTIVE_MS) {
+                Disable(ragdoll, false);
                 return;
             }
 
             float dt = CTimer::ms_fTimeStep / 50.0f;
             dt = std::clamp(dt, 0.0f, MAX_TIME_STEP);
 
-            UpdatePhysics(dt);
-            ApplyToKeyframes(dt);
+            ragdoll.ped->bUpdateMatricesRequired = true;
+            UpdatePhysics(ragdoll, dt);
+            ApplyToKeyframes(ragdoll, dt);
         }
 
-        void Enable(CPlayerPed* ped) {
-            if (!IsPedUsable(ped)) {
+        void Enable(ActiveRagdoll& ragdoll, CPed* ped, bool manual) {
+            if (!CanRagdollPed(ped)) {
                 return;
             }
 
-            m_ped = ped;
-            m_enabled = CaptureBones();
+            ragdoll = {};
+            ragdoll.ped = ped;
+            ragdoll.manual = manual;
+            ragdoll.startedAt = CTimer::m_snTimeInMilliseconds;
+            ragdoll.enabled = CaptureBones(ragdoll);
 
-            if (!m_enabled) {
-                m_ped = nullptr;
-                CMessages::AddMessageJumpQ("Ragdoll setup failed", MESSAGE_TIME_MS, 0, false);
+            if (!ragdoll.enabled) {
+                ragdoll = {};
+                if (manual) {
+                    CMessages::AddMessageJumpQ("Ragdoll setup failed", MESSAGE_TIME_MS, 0, false);
+                }
                 return;
             }
 
-            SuppressPedIK();
-            m_savedPedState.lastMoveSpeed = ped->m_vecMoveSpeed;
+            SuppressPedIK(ragdoll);
+            ragdoll.saved.lastMoveSpeed = ped->m_vecMoveSpeed;
+            ragdoll.saved.wasStanding = ped->bIsStanding;
+            ragdoll.saved.wasInAir = ped->bIsInTheAir || ped->bKnockedUpIntoAir;
+            ragdoll.saved.airTime = 0.0f;
 
-            const CVector launchImpulse = SamplePedImpulse() + CVector{ 0.30f, 0.0f, 0.65f };
-            ApplyImpulse(launchImpulse);
-            CMessages::AddMessageJumpQ("Ragdoll prototype on", MESSAGE_TIME_MS, 0, false);
+            const CVector launchImpulse = SamplePedImpulse(ragdoll) + CVector{ 0.30f, 0.0f, 0.65f };
+            ApplyImpulse(ragdoll, launchImpulse);
+
+            if (manual) {
+                CMessages::AddMessageJumpQ("Ragdoll prototype on", MESSAGE_TIME_MS, 0, false);
+            }
         }
 
-        void Disable() {
-            RestoreCapturedBones();
-            RestorePedIK();
-            m_enabled = false;
-            m_ped = nullptr;
-            m_savedPedState = {};
-            CMessages::AddMessageJumpQ("Ragdoll prototype off", MESSAGE_TIME_MS, 0, false);
+        void Disable(ActiveRagdoll& ragdoll, bool showMessage) {
+            RestoreCapturedBones(ragdoll);
+            RestorePedIK(ragdoll);
+            ragdoll = {};
+            if (showMessage) {
+                CMessages::AddMessageJumpQ("Ragdoll prototype off", MESSAGE_TIME_MS, 0, false);
+            }
         }
 
-        void SuppressPedIK() {
-            if (!m_ped || !m_ped->m_pIntelligence) {
+        void SuppressPedIK(ActiveRagdoll& ragdoll) {
+            auto* ped = ragdoll.ped;
+            if (!ped || !ped->m_pIntelligence) {
                 return;
             }
 
-            m_savedPedState.dontAcceptIKLookAts = m_ped->bDontAcceptIKLookAts;
-            m_savedPedState.isLooking = m_ped->bIsLooking;
-            m_savedPedState.isRestoringLook = m_ped->bIsRestoringLook;
-            m_savedPedState.isAimingGun = m_ped->bIsAimingGun;
-            m_savedPedState.isRestoringGun = m_ped->bIsRestoringGun;
-            m_savedPedState.canPointGunAtTarget = m_ped->bCanPointGunAtTarget;
-            m_savedPedState.updateMatricesRequired = m_ped->bUpdateMatricesRequired;
-            m_savedPedState.pedIKFlags = m_ped->m_pedIK.m_nFlags;
+            ragdoll.saved.dontAcceptIKLookAts = ped->bDontAcceptIKLookAts;
+            ragdoll.saved.isLooking = ped->bIsLooking;
+            ragdoll.saved.isRestoringLook = ped->bIsRestoringLook;
+            ragdoll.saved.isAimingGun = ped->bIsAimingGun;
+            ragdoll.saved.isRestoringGun = ped->bIsRestoringGun;
+            ragdoll.saved.canPointGunAtTarget = ped->bCanPointGunAtTarget;
+            ragdoll.saved.updateMatricesRequired = ped->bUpdateMatricesRequired;
+            ragdoll.saved.pedIKFlags = ped->m_pedIK.m_nFlags;
 
-            if (auto* task = m_ped->m_pIntelligence->m_TaskMgr.GetTaskSecondary(TASK_SECONDARY_IK)) {
-                task->MakeAbortable(m_ped, ABORT_PRIORITY_IMMEDIATE, nullptr);
+            if (auto* task = ped->m_pIntelligence->m_TaskMgr.GetTaskSecondary(TASK_SECONDARY_IK)) {
+                task->MakeAbortable(ped, ABORT_PRIORITY_IMMEDIATE, nullptr);
             }
 
-            m_ped->bDontAcceptIKLookAts = true;
-            m_ped->bIsLooking = false;
-            m_ped->bIsRestoringLook = false;
-            m_ped->bIsAimingGun = false;
-            m_ped->bIsRestoringGun = false;
-            m_ped->bCanPointGunAtTarget = false;
-            m_ped->bUpdateMatricesRequired = true;
-            m_ped->m_pedIK.m_nFlags = 0;
+            ped->bDontAcceptIKLookAts = true;
+            ped->bIsLooking = false;
+            ped->bIsRestoringLook = false;
+            ped->bIsAimingGun = false;
+            ped->bIsRestoringGun = false;
+            ped->bCanPointGunAtTarget = false;
+            ped->bUpdateMatricesRequired = true;
+            ped->m_pedIK.m_nFlags = 0;
         }
 
-        void RestorePedIK() {
-            if (!m_ped) {
+        void RestorePedIK(ActiveRagdoll& ragdoll) {
+            auto* ped = ragdoll.ped;
+            if (!ped) {
                 return;
             }
 
-            m_ped->bDontAcceptIKLookAts = m_savedPedState.dontAcceptIKLookAts;
-            m_ped->bIsLooking = m_savedPedState.isLooking;
-            m_ped->bIsRestoringLook = m_savedPedState.isRestoringLook;
-            m_ped->bIsAimingGun = m_savedPedState.isAimingGun;
-            m_ped->bIsRestoringGun = m_savedPedState.isRestoringGun;
-            m_ped->bCanPointGunAtTarget = m_savedPedState.canPointGunAtTarget;
-            m_ped->bUpdateMatricesRequired = m_savedPedState.updateMatricesRequired;
-            m_ped->m_pedIK.m_nFlags = m_savedPedState.pedIKFlags;
+            ped->bDontAcceptIKLookAts = ragdoll.saved.dontAcceptIKLookAts;
+            ped->bIsLooking = ragdoll.saved.isLooking;
+            ped->bIsRestoringLook = ragdoll.saved.isRestoringLook;
+            ped->bIsAimingGun = ragdoll.saved.isAimingGun;
+            ped->bIsRestoringGun = ragdoll.saved.isRestoringGun;
+            ped->bCanPointGunAtTarget = ragdoll.saved.canPointGunAtTarget;
+            ped->bUpdateMatricesRequired = ragdoll.saved.updateMatricesRequired;
+            ped->m_pedIK.m_nFlags = ragdoll.saved.pedIKFlags;
         }
 
-        bool CaptureBones() {
+        bool CaptureBones(ActiveRagdoll& ragdoll) {
             bool foundAny = false;
 
             for (size_t i = 0; i < kBoneDefs.size(); ++i) {
-                auto& bone = m_bones[i];
+                auto& bone = ragdoll.bones[i];
                 bone = {};
                 bone.def = kBoneDefs[i];
-                bone.frame = FindBoneFrame(m_ped, bone.def.boneId);
+                bone.frame = FindBoneFrame(ragdoll.ped, bone.def.boneId);
 
                 if (!bone.frame || !bone.frame->keyFrame) {
                     continue;
@@ -342,8 +448,8 @@ namespace {
             return foundAny;
         }
 
-        void RestoreCapturedBones() {
-            for (auto& bone : m_bones) {
+        void RestoreCapturedBones(ActiveRagdoll& ragdoll) {
+            for (auto& bone : ragdoll.bones) {
                 if (!bone.active || !bone.frame || !bone.frame->keyFrame) {
                     bone = {};
                     continue;
@@ -357,19 +463,19 @@ namespace {
             }
         }
 
-        CVector SamplePedImpulse() {
-            if (!m_ped) {
+        CVector SamplePedImpulse(ActiveRagdoll& ragdoll) {
+            if (!ragdoll.ped) {
                 return {};
             }
 
-            const CVector moveSpeed = m_ped->m_vecMoveSpeed;
-            const CVector moveDelta = moveSpeed - m_savedPedState.lastMoveSpeed;
-            m_savedPedState.lastMoveSpeed = moveSpeed;
+            const CVector moveSpeed = ragdoll.ped->m_vecMoveSpeed;
+            const CVector moveDelta = moveSpeed - ragdoll.saved.lastMoveSpeed;
+            ragdoll.saved.lastMoveSpeed = moveSpeed;
 
             CVector impulse = moveSpeed * IMPULSE_SCALE + moveDelta * (IMPULSE_SCALE * 140.0f);
 
-            if (KeyPressed('H')) {
-                const CVector forward = m_ped->GetForward();
+            if (ragdoll.manual && KeyPressed('H')) {
+                const CVector forward = ragdoll.ped->GetForward();
                 impulse += forward * 16.0f;
                 impulse.z += 10.0f;
             }
@@ -377,8 +483,8 @@ namespace {
             return impulse;
         }
 
-        void ApplyImpulse(const CVector& impulse) {
-            for (auto& bone : m_bones) {
+        void ApplyImpulse(ActiveRagdoll& ragdoll, const CVector& impulse) {
+            for (auto& bone : ragdoll.bones) {
                 if (!bone.active) {
                     continue;
                 }
@@ -389,13 +495,37 @@ namespace {
             }
         }
 
-        void UpdatePhysics(float dt) {
-            const CVector impulse = SamplePedImpulse();
-            if (impulse.MagnitudeSqr() > 0.0001f) {
-                ApplyImpulse(impulse * dt);
+        void UpdatePhysics(ActiveRagdoll& ragdoll, float dt) {
+            const CVector prevMoveSpeed = ragdoll.saved.lastMoveSpeed;
+            CVector impulse = SamplePedImpulse(ragdoll);
+            auto* ped = ragdoll.ped;
+
+            const bool inAir = ped->bIsInTheAir || ped->bKnockedUpIntoAir || !ped->bIsStanding;
+            if (inAir) {
+                ragdoll.saved.airTime += dt;
+                impulse.z -= (8.0f + ragdoll.saved.airTime * 18.0f);
             }
 
-            for (auto& bone : m_bones) {
+            if (!ragdoll.saved.wasStanding && ped->bIsStanding) {
+                const float landingShock = std::max(0.0f, -prevMoveSpeed.z) * 28.0f + ragdoll.saved.airTime * 20.0f;
+                const CVector forward = ped->GetForward();
+                impulse += forward * landingShock;
+                impulse.z += landingShock * 0.35f;
+                ragdoll.saved.airTime = 0.0f;
+            }
+
+            if (!ragdoll.saved.wasInAir && (ped->bIsInTheAir || ped->bKnockedUpIntoAir)) {
+                impulse.z += 7.5f;
+            }
+
+            ragdoll.saved.wasStanding = ped->bIsStanding;
+            ragdoll.saved.wasInAir = ped->bIsInTheAir || ped->bKnockedUpIntoAir;
+
+            if (impulse.MagnitudeSqr() > 0.0001f) {
+                ApplyImpulse(ragdoll, impulse * dt);
+            }
+
+            for (auto& bone : ragdoll.bones) {
                 if (!bone.active) {
                     continue;
                 }
@@ -408,10 +538,10 @@ namespace {
             }
         }
 
-        void ApplyToKeyframes(float dt) {
+        void ApplyToKeyframes(ActiveRagdoll& ragdoll, float dt) {
             const float blend = std::clamp(dt * 12.0f, 0.08f, 0.35f);
 
-            for (auto& bone : m_bones) {
+            for (auto& bone : ragdoll.bones) {
                 if (!bone.active || !bone.frame || !bone.frame->keyFrame) {
                     continue;
                 }

@@ -10,11 +10,13 @@
 //   `CMemoryMgr` allocator entry points with a real process-local semaphore.
 //
 // Scope of this example:
-// - Hooks `CMemoryMgr::Malloc`, `Free`, and `Realloc` at runtime.
+// - Hooks the retail PC `CMemoryMgr::Malloc`, `Free`, and `Realloc` entry points at runtime.
 // - Uses leak-shaped semaphore semantics, but adds same-thread recursion tracking
 //   so normal re-entrant allocator paths do not deadlock.
 // - Avoids extra SDK-local headers so it stays portable in a normal generated
 //   Plugin-SDK project.
+// - The in-file x86 trampoline hook is left disabled by default because its
+//   prologue assumptions are not yet verified against a live retail binary.
 
 #include "plugin.h"
 #include "common.h"
@@ -33,6 +35,7 @@ namespace {
     constexpr uintptr_t ADDR_MEMORYMGR_FREE = 0x72F430;
     constexpr uintptr_t ADDR_MEMORYMGR_REALLOC = 0x72F440;
     constexpr size_t    JMP_PATCH_SIZE = 5;
+    constexpr bool      ENABLE_UNVERIFIED_ALLOCATOR_HOOKS = false;
 
     struct LeakStyleSemaphore {
         HANDLE   handle{};
@@ -130,28 +133,43 @@ namespace {
             g_memoryMgrSemaphores = this;
             m_memMgrSema.Init();
 
-            InstallInlineHook(m_mallocHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_MALLOC), reinterpret_cast<void*>(HookedMalloc));
-            InstallInlineHook(m_freeHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_FREE), reinterpret_cast<void*>(HookedFree));
-            InstallInlineHook(m_reallocHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_REALLOC), reinterpret_cast<void*>(HookedRealloc));
+            Events::initGameEvent += [] {
+                if (g_memoryMgrSemaphores && ENABLE_UNVERIFIED_ALLOCATOR_HOOKS) {
+                    g_memoryMgrSemaphores->InstallHooksOnce();
+                }
+                };
         }
 
     private:
-        using MallocFn = void* (__cdecl*)(uint32 size, uint32 hint);
+        using MallocFn = void* (__cdecl*)(uint32 size);
         using FreeFn = void(__cdecl*)(void* memory);
-        using ReallocFn = uint8 * (__cdecl*)(void* memory, uint32 size, uint32 hint);
+        using ReallocFn = uint8 * (__cdecl*)(void* memory, uint32 size);
 
+        bool               m_installed{};
         LeakStyleSemaphore m_memMgrSema{};
         X86InlineHook      m_mallocHook{};
         X86InlineHook      m_freeHook{};
         X86InlineHook      m_reallocHook{};
 
+        void InstallHooksOnce() {
+            if (m_installed) {
+                return;
+            }
+
+            const bool mallocInstalled = InstallInlineHook(m_mallocHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_MALLOC), reinterpret_cast<void*>(HookedMalloc));
+            const bool freeInstalled = InstallInlineHook(m_freeHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_FREE), reinterpret_cast<void*>(HookedFree));
+            const bool reallocInstalled = InstallInlineHook(m_reallocHook, reinterpret_cast<void*>(ADDR_MEMORYMGR_REALLOC), reinterpret_cast<void*>(HookedRealloc));
+
+            m_installed = mallocInstalled && freeInstalled && reallocInstalled;
+        }
+
         static RestoredMemoryMgrSemaphoresSingleCpp& Instance() {
             return *g_memoryMgrSemaphores;
         }
 
-        static void* __cdecl HookedMalloc(uint32 size, uint32 hint) {
+        static void* __cdecl HookedMalloc(uint32 size) {
             ScopedLeakSemaphore lock(Instance().m_memMgrSema);
-            return Instance().m_mallocHook.Original<MallocFn>()(size, hint);
+            return Instance().m_mallocHook.Original<MallocFn>()(size);
         }
 
         static void __cdecl HookedFree(void* memory) {
@@ -159,9 +177,9 @@ namespace {
             Instance().m_freeHook.Original<FreeFn>()(memory);
         }
 
-        static uint8* __cdecl HookedRealloc(void* memory, uint32 size, uint32 hint) {
+        static uint8* __cdecl HookedRealloc(void* memory, uint32 size) {
             ScopedLeakSemaphore lock(Instance().m_memMgrSema);
-            return Instance().m_reallocHook.Original<ReallocFn>()(memory, size, hint);
+            return Instance().m_reallocHook.Original<ReallocFn>()(memory, size);
         }
     };
 
